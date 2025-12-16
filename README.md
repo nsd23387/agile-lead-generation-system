@@ -10,3 +10,19 @@ This repo includes agent definitions you can select in Cursor:
 - Open Cursor → Agents
 - Add/select an agent from the repo (point to one of the files above)
 - Use it to implement the system incrementally (MVP first)
+
+## Simplified system (React + optional Supabase)
+
+### Run locally
+
+```bash
+npm install
+npm run dev
+```
+
+### Optional: Supabase persistence
+Set these env vars (e.g. in `.env.local`):
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_ANON_KEY`
+
+The app will still work without Supabase (draft generation is always dry-run).
