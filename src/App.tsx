@@ -1,120 +1,117 @@
-import React, { useMemo, useState } from 'react';
-import { getSupabaseClient } from './lib/supabase';
-import { parseLeadsCsv } from './lib/csv';
-import type { DraftMessage, Lead } from './lib/types';
-import { scoreLead, segmentLeads, type ScoringRule } from './lib/rules';
-import { renderEmailDraft } from './lib/templates';
+import React, { useEffect, useMemo, useState } from 'react';
+import { supabase } from './lib/supabase';
+import type { CampaignSimpleTrace, CampaignSimpleTraceRow } from './lib/types';
 
-const DEFAULT_SEGMENT = { name: 'default', requireEmail: true } as const;
-const DEFAULT_SCORING: ScoringRule[] = [
-  { points: 10, field: 'title', op: 'contains', value: 'Head' },
-  { points: 5, field: 'company', op: 'not_empty' }
-];
+function asNumber(x: unknown): number {
+  return typeof x === 'number' && Number.isFinite(x) ? x : Number(x ?? 0) || 0;
+}
 
-function uid(): string {
-  return crypto.randomUUID();
+function normalizeTrace(raw: any): CampaignSimpleTrace {
+  return {
+    campaign_id: String(raw?.campaign_id ?? ''),
+    audience_total: asNumber(raw?.audience_total),
+    personalized_total: asNumber(raw?.personalized_total),
+    ready_total: asNumber(raw?.ready_total),
+    claimed_total: asNumber(raw?.claimed_total),
+    sent_total: asNumber(raw?.sent_total),
+    failed_total: asNumber(raw?.failed_total),
+    replies_total: asNumber(raw?.replies_total),
+    updated_at: String(raw?.updated_at ?? '')
+  };
 }
 
 export default function App() {
-  const [csvText, setCsvText] = useState<string>(
-    'email,first_name,last_name,company,title,website\n' +
-      'alex@example.com,Alex,Kim,Acme Inc,Head of Growth,https://acme.example\n' +
-      'sam@example.com,Sam,Patel,Example Co,Marketing Manager,https://example.example\n'
-  );
-  const [senderName, setSenderName] = useState('Your Name');
-  const [topic, setTopic] = useState('campaign performance');
-  const [drafts, setDrafts] = useState<DraftMessage[] | null>(null);
+  const [rows, setRows] = useState<CampaignSimpleTraceRow[]>([]);
+  const [selectedCampaignId, setSelectedCampaignId] = useState<string>('');
+  const [trace, setTrace] = useState<CampaignSimpleTrace | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const supabaseEnabled = useMemo(() => getSupabaseClient() != null, []);
+  const configured = supabase != null;
 
-  const leads: Lead[] = useMemo(() => {
-    const parsed = parseLeadsCsv(csvText);
-    const withScore = parsed
-      .filter((l) => (l.email ?? '').trim() !== '')
-      .map((l) => {
-        const score = scoreLead(l, DEFAULT_SCORING);
-        return {
-          id: uid(),
-          email: l.email,
-          first_name: l.first_name,
-          last_name: l.last_name,
-          company: l.company,
-          title: l.title,
-          website: l.website,
-          score,
-          segment: DEFAULT_SEGMENT.name
-        } satisfies Lead;
-      });
+  const selectedName = useMemo(() => {
+    const r = rows.find((x) => x.campaign_id === selectedCampaignId);
+    return r?.campaign_name ?? '';
+  }, [rows, selectedCampaignId]);
 
-    return segmentLeads(withScore, DEFAULT_SEGMENT).sort((a, b) => b.score - a.score);
-  }, [csvText]);
-
-  function generateDrafts() {
+  async function refreshCampaignList() {
     setError(null);
+    if (!supabase) return;
+    setLoading(true);
     try {
-      const out = leads.map((l) => renderEmailDraft(l, { senderName, topic }));
-      setDrafts(out);
+      const res = await supabase
+        .from('v_campaign_simple_trace_v3')
+        .select('campaign_id,campaign_name,trace');
+
+      if (res.error) throw res.error;
+
+      const list: CampaignSimpleTraceRow[] = (res.data ?? []).map((r: any) => ({
+        campaign_id: String(r.campaign_id),
+        campaign_name: String(r.campaign_name ?? ''),
+        trace: normalizeTrace(r.trace)
+      }));
+
+      setRows(list);
+      if (!selectedCampaignId && list.length > 0) setSelectedCampaignId(list[0].campaign_id);
     } catch (e) {
-      setDrafts(null);
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
     }
   }
 
-  async function saveToSupabase() {
+  async function refreshTrace() {
     setError(null);
-    const client = getSupabaseClient();
-    if (!client) {
-      setError('Supabase not configured (missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).');
-      return;
-    }
-    if (!drafts || drafts.length === 0) {
-      setError('Generate drafts first.');
+    if (!supabase) return;
+    if (!selectedCampaignId) {
+      setTrace(null);
       return;
     }
 
-    // This is intentionally a best-effort placeholder. You’ll need tables:
-    // - leads(id uuid, email text, first_name text, last_name text, company text, title text, website text, score int, segment text)
-    // - drafts(id uuid, lead_id uuid, to text, subject text, body text)
+    setLoading(true);
     try {
-      const leadsPayload = leads.map((l) => ({
-        id: l.id,
-        email: l.email,
-        first_name: l.first_name ?? null,
-        last_name: l.last_name ?? null,
-        company: l.company ?? null,
-        title: l.title ?? null,
-        website: l.website ?? null,
-        score: l.score,
-        segment: l.segment
-      }));
-
-      const draftsPayload = drafts.map((d) => ({
-        id: uid(),
-        lead_id: d.leadId,
-        to: d.to,
-        subject: d.subject,
-        body: d.body
-      }));
-
-      const a = await client.from('leads').upsert(leadsPayload, { onConflict: 'id' });
-      if (a.error) throw a.error;
-
-      const b = await client.from('drafts').insert(draftsPayload);
-      if (b.error) throw b.error;
-
-      setError(null);
-      alert(`Saved ${leadsPayload.length} leads and ${draftsPayload.length} drafts to Supabase.`);
+      // Prefer single-RPC trace (matches the simplified design)
+      const rpc = await supabase.rpc('get_campaign_simple_trace_v3', {
+        p_campaign_id: selectedCampaignId
+      });
+      if (rpc.error) throw rpc.error;
+      setTrace(normalizeTrace(rpc.data));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
     }
+  }
+
+  useEffect(() => {
+    void refreshCampaignList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    void refreshTrace();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCampaignId]);
+
+  if (!configured) {
+    return (
+      <div style={{ fontFamily: 'ui-sans-serif, system-ui', padding: 24, maxWidth: 980, margin: '0 auto' }}>
+        <h2 style={{ margin: 0 }}>Campaign Automation (Simplified)</h2>
+        <p style={{ color: '#555' }}>
+          This panel reads from <code>v_campaign_simple_trace_v3</code>.
+        </p>
+        <div style={{ background: '#fff7ed', border: '1px solid #fed7aa', padding: 12, borderRadius: 8 }}>
+          Missing Supabase env vars. Set <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code>.
+        </div>
+      </div>
+    );
   }
 
   return (
     <div style={{ fontFamily: 'ui-sans-serif, system-ui', padding: 24, maxWidth: 980, margin: '0 auto' }}>
-      <h2 style={{ margin: 0 }}>Campaign Automation (Simplified, Dry-run)</h2>
+      <h2 style={{ margin: 0 }}>Campaign Automation (Simplified)</h2>
       <p style={{ color: '#555' }}>
-        Import audience → score/segment → generate email drafts. Nothing is sent automatically.
+        Trace campaigns end-to-end (audience → personalized → ready → claimed → sent → replies). No sending happens from this UI.
       </p>
 
       {error && (
@@ -123,102 +120,71 @@ export default function App() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
-        <div>
-          <h3 style={{ marginBottom: 8 }}>1) Paste CSV</h3>
-          <textarea
-            value={csvText}
-            onChange={(e) => setCsvText(e.target.value)}
-            rows={12}
-            style={{ width: '100%', fontFamily: 'ui-monospace, SFMono-Regular', fontSize: 13 }}
-          />
-          <div style={{ marginTop: 8, color: '#555' }}>
-            Expected columns: <code>email, first_name, last_name, company, title, website</code>
-          </div>
-        </div>
-
-        <div>
-          <h3 style={{ marginBottom: 8 }}>2) Draft settings</h3>
-          <label style={{ display: 'block', marginBottom: 8 }}>
-            Sender name
-            <input
-              value={senderName}
-              onChange={(e) => setSenderName(e.target.value)}
-              style={{ display: 'block', width: '100%', padding: 8 }}
-            />
-          </label>
-          <label style={{ display: 'block', marginBottom: 8 }}>
-            Topic
-            <input
-              value={topic}
-              onChange={(e) => setTopic(e.target.value)}
-              style={{ display: 'block', width: '100%', padding: 8 }}
-            />
-          </label>
-
-          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-            <button onClick={generateDrafts} style={{ padding: '8px 12px' }}>
-              Generate drafts
-            </button>
-            <button
-              onClick={saveToSupabase}
-              disabled={!supabaseEnabled}
-              title={supabaseEnabled ? '' : 'Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY'}
-              style={{ padding: '8px 12px' }}
-            >
-              Save to Supabase
-            </button>
-          </div>
-
-          <div style={{ marginTop: 12, color: '#555' }}>
-            Scoring rules (hardcoded MVP): +10 title contains “Head”, +5 company not empty.
-          </div>
-        </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, flexWrap: 'wrap' }}>
+        <button onClick={() => void refreshCampaignList()} disabled={loading} style={{ padding: '8px 12px' }}>
+          Refresh list
+        </button>
+        <button onClick={() => void refreshTrace()} disabled={loading || !selectedCampaignId} style={{ padding: '8px 12px' }}>
+          Refresh trace
+        </button>
       </div>
 
-      <div style={{ marginTop: 24 }}>
-        <h3 style={{ marginBottom: 8 }}>Leads ({leads.length})</h3>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: 'left', borderBottom: '1px solid #ddd', padding: 8 }}>Score</th>
-                <th style={{ textAlign: 'left', borderBottom: '1px solid #ddd', padding: 8 }}>Email</th>
-                <th style={{ textAlign: 'left', borderBottom: '1px solid #ddd', padding: 8 }}>Company</th>
-                <th style={{ textAlign: 'left', borderBottom: '1px solid #ddd', padding: 8 }}>Title</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leads.map((l) => (
-                <tr key={l.id}>
-                  <td style={{ padding: 8, borderBottom: '1px solid #f0f0f0' }}>{l.score}</td>
-                  <td style={{ padding: 8, borderBottom: '1px solid #f0f0f0' }}>{l.email}</td>
-                  <td style={{ padding: 8, borderBottom: '1px solid #f0f0f0' }}>{l.company ?? ''}</td>
-                  <td style={{ padding: 8, borderBottom: '1px solid #f0f0f0' }}>{l.title ?? ''}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr', gap: 16, marginTop: 16 }}>
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Campaigns</div>
+          <select
+            value={selectedCampaignId}
+            onChange={(e) => setSelectedCampaignId(e.target.value)}
+            style={{ width: '100%', padding: 8 }}
+          >
+            {rows.length === 0 ? (
+              <option value="">(none)</option>
+            ) : (
+              rows.map((r) => (
+                <option key={r.campaign_id} value={r.campaign_id}>
+                  {r.campaign_name || r.campaign_id}
+                </option>
+              ))
+            )}
+          </select>
+          <div style={{ marginTop: 10, color: '#666', fontSize: 12 }}>
+            Source: <code>v_campaign_simple_trace_v3</code>
+          </div>
         </div>
-      </div>
 
-      <div style={{ marginTop: 24 }}>
-        <h3 style={{ marginBottom: 8 }}>Drafts {drafts ? `(${drafts.length})` : ''}</h3>
-        {!drafts ? (
-          <div style={{ color: '#555' }}>Click “Generate drafts” to preview.</div>
-        ) : (
-          <div style={{ display: 'grid', gap: 12 }}>
-            {drafts.slice(0, 5).map((d) => (
-              <div key={`${d.leadId}-${d.subject}`} style={{ border: '1px solid #ddd', borderRadius: 10, padding: 12 }}>
-                <div style={{ fontSize: 12, color: '#666' }}>To: {d.to}</div>
-                <div style={{ marginTop: 6, fontWeight: 600 }}>Subject: {d.subject}</div>
-                <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap' }}>{d.body}</pre>
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Trace {selectedName ? `— ${selectedName}` : ''}</div>
+          {!trace ? (
+            <div style={{ color: '#666' }}>Select a campaign to load its trace.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
+              <Stat label="Audience" value={trace.audience_total} />
+              <Stat label="Personalized" value={trace.personalized_total} />
+              <Stat label="Ready" value={trace.ready_total} />
+              <Stat label="Claimed" value={trace.claimed_total} />
+              <Stat label="Sent" value={trace.sent_total} />
+              <Stat label="Replies" value={trace.replies_total} />
+              <Stat label="Failed" value={trace.failed_total} />
+              <div style={{ gridColumn: '1 / -1', marginTop: 6, color: '#666', fontSize: 12 }}>
+                Updated: <code>{trace.updated_at}</code>
               </div>
-            ))}
-            {drafts.length > 5 && <div style={{ color: '#555' }}>Showing first 5 drafts.</div>}
-          </div>
-        )}
+              <details style={{ gridColumn: '1 / -1', marginTop: 8 }}>
+                <summary>Raw trace JSON</summary>
+                <pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify(trace, null, 2)}</pre>
+              </details>
+            </div>
+          )}
+        </div>
       </div>
+    </div>
+  );
+}
+
+function Stat(props: { label: string; value: number }) {
+  return (
+    <div style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 12, background: 'white' }}>
+      <div style={{ color: '#666', fontSize: 12 }}>{props.label}</div>
+      <div style={{ fontSize: 26, fontWeight: 700, marginTop: 2 }}>{props.value}</div>
     </div>
   );
 }
