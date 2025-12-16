@@ -1,0 +1,22 @@
+# Simplified, config-driven rules
+segments:
+  - name: default
+    filters:
+      - field: email
+        op: not_empty
+
+scoring:
+  # Add points if a field matches a condition
+  rules:
+    - points: 10
+      field: title
+      op: contains
+      value: "Head"
+    - points: 5
+      field: company
+      op: not_empty
+
+defaults:
+  channel: email
+  subject_template: "templates/email_subject.j2"
+  body_template: "templates/email_body.j2"
